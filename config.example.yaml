@@ -2,25 +2,33 @@
 #
 # Validates step-ca SCEP enrollments against Intune and reports issuance results,
 # via step-ca's SCEPCHALLENGE (-> /validate) and NOTIFYING (-> /notify) webhooks.
+# Unknown keys are an error. Full reference: docs/configuration.md.
 server:
   listen: ":8080"
   tls:
     enabled: false             # set true and provide cert/key to serve HTTPS
     cert: ""                   #   (step-ca requires the webhook URL to be https;
     key: ""                    #    alternatively terminate TLS at a proxy)
+    # client_ca: ""            # step-ca's root (PEM): require step-ca's client certificate (mTLS)
+    # client_dns_names: []     # ...and one of these DNS SANs on it (step-ca's dnsNames)
+    # min_version: "1.3"       # "1.3" or "1.2"
 webhook:
-  # step-ca generates a distinct secret per webhook (printed by
-  # `step ca provisioner webhook add`), so each endpoint has its own.
-  validate_secret: ""          # base64 SCEPCHALLENGE secret; prefer env SCEP_VALIDATE_SECRET
-  notify_secret: ""            # base64 NOTIFYING secret;     prefer env SCEP_NOTIFY_SECRET
+  # REQUIRED. step-ca generates a distinct 64-byte secret per webhook (printed
+  # by `step ca provisioner webhook add`). The bridge refuses to start if either
+  # is missing, not base64, shorter than 32 bytes, or both are the same.
+  validate_secret: ""          # base64 SCEPCHALLENGE secret; prefer validate_secret_file or env SCEP_VALIDATE_SECRET(_FILE)
+  notify_secret: ""            # base64 NOTIFYING secret;     prefer notify_secret_file   or env SCEP_NOTIFY_SECRET(_FILE)
+  # max_request_age: 5m        # replay window for step-ca's signed request timestamp
 logging:
   output: "stdout"             # "stdout", "stderr", or a file path (append/created)
   format: "json"               # "json" or "text"
   level: "info"                # "debug", "info", "warn", or "error"
 intune:
+  auth: "client_secret"        # or "workload_identity" (secretless, Kubernetes): docs/kubernetes.md
   tenant_id: ""                # or env INTUNE_TENANT_ID
   client_id: ""                # or env INTUNE_CLIENT_ID
-  client_secret: ""            # prefer env INTUNE_CLIENT_SECRET
+  client_secret: ""            # client_secret auth only; prefer client_secret_file or env INTUNE_CLIENT_SECRET(_FILE)
+  # federated_token_file: ""   # workload_identity only; defaults to AZURE_FEDERATED_TOKEN_FILE
   caller_info: "step-ca-scep"
   # Microsoft endpoints. The defaults target the commercial cloud; change them
   # only for another Microsoft cloud or a test mock (see docs/configuration.md).

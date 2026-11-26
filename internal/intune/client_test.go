@@ -224,3 +224,47 @@ func TestDiscoveryRejectsNonHTTPSServiceURI(t *testing.T) {
 		t.Fatalf("err = %v, want a refusal of the non-https service URI", err)
 	}
 }
+
+// A bearer token must never follow a redirect.
+func TestClientRefusesRedirects(t *testing.T) {
+	var followed bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/elsewhere", func(http.ResponseWriter, *http.Request) { followed = true })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(&fakeTokens{}, "test", Endpoints{GraphURL: srv.URL + "/", ResourceURL: testResourceURL, AppID: "a"})
+	if _, err := c.discover(context.Background()); err == nil {
+		t.Fatal("discovery followed or accepted a redirect")
+	}
+	if followed {
+		t.Fatal("the redirect was followed")
+	}
+}
+
+func TestClientBoundsResponseSize(t *testing.T) {
+	srv, _ := newTestServer(t, "Success")
+	big := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"code":"` + strings.Repeat("x", maxResponseBytes) + `"}`))
+	}))
+	t.Cleanup(big.Close)
+	c := newTestClient(srv)
+	c.baseURI = big.URL
+	if err := c.Validate(context.Background(), "t", []byte("csr")); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err = %v, want size error", err)
+	}
+}
+
+func TestCheckServiceURIRejectsUserinfoQueryFragment(t *testing.T) {
+	c := New(&fakeTokens{}, "test", Endpoints{GraphURL: "https://graph.example/"})
+	for _, u := range []string{"https://u:p@svc.example/", "https://svc.example/?q=1", "https://svc.example/#f", "http://svc.example/"} {
+		if err := c.checkServiceURI(u); err == nil {
+			t.Errorf("%s accepted", u)
+		}
+	}
+	if err := c.checkServiceURI("https://fef.msua06.manage.microsoft.com/TrafficGateway/Service"); err != nil {
+		t.Errorf("valid URI refused: %v", err)
+	}
+}

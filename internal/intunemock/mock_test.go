@@ -298,3 +298,38 @@ func TestRecordsCapped(t *testing.T) {
 		t.Fatalf("records = %+v, want the last 3 (t2..t4)", recs)
 	}
 }
+
+// A workload identity authenticates with a JWT client assertion instead of a
+// secret; the mock accepts it, and checks it when ClientAssertion is set.
+func TestTokenClientAssertion(t *testing.T) {
+	srv, _ := newTestMock(t, Options{ClientAssertion: "projected-sa-token"})
+	form := func(assertion, assertionType, secret string) url.Values {
+		f := url.Values{
+			"grant_type": {"client_credentials"},
+			"client_id":  {"c"},
+			"scope":      {defaultIntuneScope},
+		}
+		if assertion != "" {
+			f.Set("client_assertion", assertion)
+			f.Set("client_assertion_type", assertionType)
+		}
+		if secret != "" {
+			f.Set("client_secret", secret)
+		}
+		return f
+	}
+	for name, tc := range map[string]struct {
+		form url.Values
+		want int
+	}{
+		"matching assertion":   {form("projected-sa-token", jwtBearer, ""), http.StatusOK},
+		"other assertion":      {form("someone-elses-token", jwtBearer, ""), http.StatusUnauthorized},
+		"wrong type":           {form("projected-sa-token", "urn:other", ""), http.StatusUnauthorized},
+		"secret and assertion": {form("projected-sa-token", jwtBearer, "s"), http.StatusUnauthorized},
+		"neither":              {form("", "", ""), http.StatusUnauthorized},
+	} {
+		if code, b := tokenRequest(t, srv.URL, tc.form); code != tc.want {
+			t.Errorf("%s: code = %d (%s), want %d", name, code, b, tc.want)
+		}
+	}
+}

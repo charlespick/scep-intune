@@ -42,7 +42,10 @@ type Options struct {
 	AppID        string // default Intune's app ID
 	ClientID     string // when set, the only client ID the token endpoint accepts
 	ClientSecret string // when set, the only secret the token endpoint accepts
-	MaxRecords   int    // request log size; default 1000, oldest dropped first
+	// ClientAssertion, when set, is the only client assertion (the federated
+	// token a workload identity presents) the token endpoint accepts.
+	ClientAssertion string
+	MaxRecords      int // request log size; default 1000, oldest dropped first
 }
 
 // ValidateBaseURL reports whether s can be the mock's base URL: an absolute
@@ -173,10 +176,7 @@ func (m *Mock) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_grant_type"})
 		return
 	}
-	id, secret := r.PostForm.Get("client_id"), r.PostForm.Get("client_secret")
-	if id == "" || secret == "" ||
-		(m.opts.ClientID != "" && id != m.opts.ClientID) ||
-		(m.opts.ClientSecret != "" && secret != m.opts.ClientSecret) {
+	if !m.clientAuthenticated(r.PostForm) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_client"})
 		return
 	}
@@ -199,6 +199,30 @@ func (m *Mock) handleToken(w http.ResponseWriter, r *http.Request) {
 		"token_type":   "Bearer",
 		"expires_in":   3600,
 	})
+}
+
+// jwtBearer is the client_assertion_type of a federated (JWT) client assertion.
+const jwtBearer = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" //nolint:gosec // G101: an RFC 7523 type URN, not a credential
+
+// clientAuthenticated checks the client credentials of a token request: a
+// client secret or, as a workload identity sends, a JWT client assertion. The
+// mock doesn't verify the assertion's signature (Entra checks it against the
+// federated credential's issuer); with ClientAssertion set it must match.
+func (m *Mock) clientAuthenticated(form url.Values) bool {
+	id := form.Get("client_id")
+	if id == "" || (m.opts.ClientID != "" && id != m.opts.ClientID) {
+		return false
+	}
+	secret, assertion := form.Get("client_secret"), form.Get("client_assertion")
+	switch {
+	case secret != "" && assertion == "":
+		return m.opts.ClientSecret == "" || secret == m.opts.ClientSecret
+	case assertion != "" && secret == "":
+		return form.Get("client_assertion_type") == jwtBearer &&
+			(m.opts.ClientAssertion == "" || assertion == m.opts.ClientAssertion)
+	default:
+		return false
+	}
 }
 
 // resourceScope returns the single resource scope of a token request. MSAL

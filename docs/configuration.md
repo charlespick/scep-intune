@@ -6,24 +6,36 @@ Secrets should come from the **environment** rather than the file.
 
 ## File reference
 
+Unknown keys are an error, so a misspelt setting (for example a secret's key)
+cannot be silently ignored.
+
 ```yaml
 server:
   listen: ":8080"           # address:port to listen on
   tls:
     enabled: false          # serve HTTPS directly (see "TLS" below)
-    cert: ""                # PEM cert path (required if enabled)
+    cert: ""                # PEM cert path (required if enabled); reloaded when it changes
     key: ""                 # PEM key path  (required if enabled)
+    client_ca: ""           # PEM CA bundle: require a client certificate from it (mTLS)
+    client_dns_names: []    # require one of these DNS SANs on the client certificate
+    min_version: "1.3"      # "1.3" (default) or "1.2"
 
 webhook:
-  # step-ca generates a DISTINCT secret per webhook, so each endpoint has its own.
-  # base64 HMAC-SHA256 keys; prefer the env vars below.
+  # REQUIRED. step-ca generates a DISTINCT secret per webhook, so each endpoint
+  # has its own. base64 HMAC-SHA256 keys, inline or (preferred) from a file.
   validate_secret: ""       # SCEPCHALLENGE webhook secret
+  validate_secret_file: ""  #   ...or a file holding it
   notify_secret: ""         # NOTIFYING webhook secret
+  notify_secret_file: ""    #   ...or a file holding it
+  max_request_age: 5m       # accepted skew of step-ca's signed timestamp (30s-1h)
 
 intune:
+  auth: client_secret       # client_secret | workload_identity
   tenant_id: ""             # Entra tenant (directory) ID
   client_id: ""             # Entra app (client) ID
-  client_secret: ""         # Entra app client secret (prefer env)
+  client_secret: ""         # client_secret auth: Entra app client secret
+  client_secret_file: ""    #   ...or a file holding it
+  federated_token_file: ""  # workload_identity auth: projected service account token
   caller_info: "step-ca-scep"
   # Microsoft endpoints (see "Microsoft endpoints" below); defaults shown.
   authority_host: "https://login.microsoftonline.com/"
@@ -39,28 +51,40 @@ logging:
 
 ## Environment overrides
 
-Environment variables take precedence over the file — use them for secrets so
-nothing sensitive lands on disk:
+Environment variables take precedence over the file. Use them, or better the
+`*_FILE` variants pointing at a mounted secret, so nothing sensitive lands in
+the config file:
 
 | Env var | Overrides |
 |---------|-----------|
+| `INTUNE_AUTH` | `intune.auth` |
 | `INTUNE_TENANT_ID` | `intune.tenant_id` |
 | `INTUNE_CLIENT_ID` | `intune.client_id` |
-| `INTUNE_CLIENT_SECRET` | `intune.client_secret` |
-| `SCEP_VALIDATE_SECRET` | `webhook.validate_secret` (SCEPCHALLENGE) |
-| `SCEP_NOTIFY_SECRET` | `webhook.notify_secret` (NOTIFYING) |
+| `INTUNE_CLIENT_SECRET` / `INTUNE_CLIENT_SECRET_FILE` | `intune.client_secret` / `intune.client_secret_file` |
+| `INTUNE_FEDERATED_TOKEN_FILE` | `intune.federated_token_file` |
+| `SCEP_VALIDATE_SECRET` / `SCEP_VALIDATE_SECRET_FILE` | `webhook.validate_secret` / `webhook.validate_secret_file` (SCEPCHALLENGE) |
+| `SCEP_NOTIFY_SECRET` / `SCEP_NOTIFY_SECRET_FILE` | `webhook.notify_secret` / `webhook.notify_secret_file` (NOTIFYING) |
 | `INTUNE_AUTHORITY_HOST` | `intune.authority_host` |
 | `INTUNE_GRAPH_URL` | `intune.graph_url` |
 | `INTUNE_RESOURCE_URL` | `intune.resource_url` |
 | `INTUNE_APP_ID` | `intune.app_id` |
 
-An environment variable overrides the file only when it is non-empty.
+An environment variable overrides the file only when it is non-empty. A secret
+given both inline and as a file is refused as ambiguous; a secret file's
+surrounding whitespace (such as a trailing newline) is trimmed.
 
-`intune.tenant_id`, `intune.client_id`, and `intune.client_secret` are
-**required**.
+Always required: both webhook secrets, `intune.tenant_id` and
+`intune.client_id`. Then, by `intune.auth`:
 
-The webhook secrets are optional but strongly recommended — see
-below.
+| `intune.auth` | Also required | Must be empty |
+|---------------|---------------|---------------|
+| `client_secret` (default) | `intune.client_secret` | `intune.federated_token_file` |
+| `workload_identity` | `intune.federated_token_file` | `intune.client_secret` |
+
+With `workload_identity`, `tenant_id`, `client_id` and `federated_token_file`
+fall back to `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and
+`AZURE_FEDERATED_TOKEN_FILE`, which the Azure workload identity webhook injects
+into the pod. See [kubernetes.md](kubernetes.md).
 
 ## Microsoft endpoints
 
@@ -115,18 +139,48 @@ Point `authority_host` and `graph_url` at the bundled Intune mock and leave
 
 step-ca signs each webhook call with the secret generated when you ran
 `step ca provisioner webhook add` (see [step-ca-setup.md](step-ca-setup.md)).
-Provide the matching secrets so the bridge can verify the signature.
+Both secrets are **required**. The bridge refuses to start when either is:
 
-If a secret is left empty the bridge logs a warning and accepts unsigned
-requests — only acceptable on a trusted/isolated network. Note that a
-`ca.json`-managed step-ca provisioner **cannot store a webhook secret** (the
-field is `json:"-"`), so it signs with an empty key; real secrets require
-running step-ca in **remote-management (admin) mode**.
+- missing or empty,
+- not valid base64,
+- shorter than 32 bytes once decoded (step-ca generates 64), or
+- identical to the other one (step-ca generates a distinct secret per webhook).
+
+There is no unauthenticated mode. A `ca.json`-managed step-ca provisioner
+**cannot store a webhook secret** (the field is `json:"-"`) and signs with an
+empty key, so it cannot be used with this bridge: run step-ca in
+**remote-management (admin) mode**.
+
+Each signed request also carries step-ca's timestamp, covered by the
+signature. Requests whose timestamp is missing, or further than
+`webhook.max_request_age` (default 5 minutes) from the bridge's clock in either
+direction, are refused, which bounds how long a captured request can be
+replayed. Keep step-ca's and the bridge's clocks NTP-synchronised.
 
 ## TLS
 
 step-ca requires webhook URLs to be **HTTPS**. Either:
 
 - set `server.tls.enabled: true` with a `cert`/`key`, or
-- terminate TLS at a reverse proxy (e.g. Caddy, nginx) in front of the bridge —
-  the recommended setup, since the proxy can also handle certificate renewal.
+- terminate TLS at a reverse proxy (e.g. Caddy, nginx) in front of the bridge,
+  on the same host or in the same pod. The bridge warns when it serves plain
+  HTTP on a non-loopback address: webhook bodies carry each device's SCEP
+  challenge.
+
+When the bridge serves TLS itself:
+
+- **TLS 1.3** is the minimum by default (step-ca is a Go client and always
+  negotiates it). Set `min_version: "1.2"` only for a proxy that can't.
+- The certificate and key are **re-read when their files change** (checked
+  every minute), so short-lived certificates (step-ca issues 24 h ones by
+  default) can be renewed in place, for example by `step ca renew --daemon` or
+  cert-manager. A pair that fails to load is logged and the previous one stays
+  in use. The bridge warns once the certificate enters the last tenth of its
+  lifetime without having been renewed.
+- **Mutual TLS** with step-ca: step-ca presents its own TLS certificate to
+  webhook servers (unless the webhook was created with
+  `--disable-tls-client-auth`). Set `client_ca` to step-ca's root certificate
+  and `client_dns_names` to (one of) step-ca's `dnsNames`, and `/validate` and
+  `/notify` only answer step-ca: any other client gets `403` before its request
+  is read. `/healthz` stays reachable without a certificate, for health probes.
+  This is a second, independent factor next to the HMAC secrets.

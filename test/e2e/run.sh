@@ -115,9 +115,18 @@ step certificate create "Intune SCEP RA" ra.crt ra.key \
 
 # ----------------------------------------------------------------- the mock
 log "Intune mock"
-intune-mock -listen "$MOCK" -cert mock.crt -key mock.key -base-url "https://$MOCK" >>"$STATE/mock.log" 2>&1 &
-PIDS+=("$!")
-wait_for "https://$MOCK/healthz" --cacert root_ca.crt
+start_mock() { # start_mock [extra flags...]
+  intune-mock -listen "$MOCK" -cert mock.crt -key mock.key -base-url "https://$MOCK" "$@" >>"$STATE/mock.log" 2>&1 &
+  MOCK_PID=$!
+  PIDS+=("$MOCK_PID")
+  wait_for "https://$MOCK/healthz" --cacert root_ca.crt
+}
+restart_mock() {
+  kill "$MOCK_PID"
+  wait "$MOCK_PID" 2>/dev/null || true
+  start_mock "$@"
+}
+start_mock
 MOCK_API="https://$MOCK/_mock/requests"
 records() { curl -fsS --cacert root_ca.crt "$MOCK_API"; }
 reset_records() { curl -fsS --cacert root_ca.crt -X DELETE "$MOCK_API"; }
@@ -145,25 +154,61 @@ wait "$CA_PID" 2>/dev/null || true
 start_ca
 
 # --------------------------------------------------------------- the bridge
-cat >bridge.yaml <<YAML
+# Mutual TLS: step-ca presents its own TLS certificate (issued by its
+# intermediate, DNS SAN "localhost" here) to webhook servers.
+server_yaml() {
+  cat <<YAML
 server:
   listen: "$BRIDGE"
-  tls: {enabled: true, cert: "$STATE/bridge.crt", key: "$STATE/bridge.key"}
+  tls:
+    enabled: true
+    cert: "$STATE/bridge.crt"
+    key: "$STATE/bridge.key"
+    client_ca: "$STATE/root_ca.crt"
+    client_dns_names: [localhost]
 logging: {format: text, level: debug}
-intune: {tenant_id: e2e-tenant, client_id: e2e-client, client_secret: e2e-secret}
 YAML
+}
+{ server_yaml; echo 'intune: {tenant_id: e2e-tenant, client_id: e2e-client, client_secret: e2e-secret}'; } >bridge.yaml
+# Workload identity: no client secret anywhere, a projected-token file instead.
+{ server_yaml; echo 'intune: {auth: workload_identity}'; } >bridge-wi.yaml
 
-start_bridge() { # start_bridge [extra env assignments...]
-  env SSL_CERT_FILE="$STATE/root_ca.crt" \
+BRIDGE_CONFIG=bridge.yaml
+BRIDGE_WRAP=() # command prefix for the bridge, e.g. (timeout 10)
+bridge_cmd() { # bridge_cmd [extra env assignments...]: execs the bridge; call it in a subshell or with &
+  exec env SSL_CERT_FILE="$STATE/root_ca.crt" \
     SCEP_VALIDATE_SECRET="$VALIDATE_SECRET" SCEP_NOTIFY_SECRET="$NOTIFY_SECRET" \
     INTUNE_AUTHORITY_HOST="https://$MOCK/" INTUNE_GRAPH_URL="https://$MOCK/" \
-    "$@" scep-intune -config bridge.yaml >>"$STATE/bridge.log" 2>&1 &
+    "$@" "${BRIDGE_WRAP[@]}" scep-intune -config "$BRIDGE_CONFIG"
+}
+start_bridge() { # start_bridge [extra env assignments...]
+  bridge_cmd "$@" >>"$STATE/bridge.log" 2>&1 &
   BRIDGE_PID=$!
   PIDS+=("$BRIDGE_PID")
   wait_for "https://$BRIDGE/healthz" --cacert root_ca.crt
 }
+stop_bridge() {
+  kill "$BRIDGE_PID"
+  wait "$BRIDGE_PID" 2>/dev/null || true
+}
+
+log "Case 0: the bridge refuses to start without valid webhook secrets"
+# Empty, shared with the other webhook, and too short ("short", 5 bytes).
+BRIDGE_WRAP=(timeout 10)
+for bad in "SCEP_NOTIFY_SECRET=" "SCEP_NOTIFY_SECRET=$VALIDATE_SECRET" "SCEP_VALIDATE_SECRET=c2hvcnQ="; do
+  if out="$(bridge_cmd "$bad" 2>&1)"; then fail "the bridge started with $bad"; fi
+  grep -q '"msg":"config"' <<<"$out" || fail "the bridge didn't report a config error for $bad: $out"
+done
+BRIDGE_WRAP=()
+echo "refused to start"
+
 log "Bridge pointed at the mock"
 start_bridge
+
+log "Mutual TLS: webhook paths require step-ca's client certificate"
+code="$(curl -s -o /dev/null -w '%{http_code}' --cacert root_ca.crt -X POST "https://$BRIDGE/validate" -d '{}')"
+[[ "$code" == 403 ]] || fail "POST /validate without a client certificate answered $code, want 403"
+echo "refused without a client certificate"
 
 # ---------------------------------------------------------------- enrollment
 # enroll <challenge> <name>: returns scepclient's exit status. Each enrollment
@@ -221,8 +266,7 @@ grep -q "HTTP 503" <<<"$(bridge_log_since "$mark")" || fail "the bridge didn't l
 echo "failed as expected"
 
 log "Case 4: wrong Intune scope configured → sign-in fails, as with Entra"
-kill "$BRIDGE_PID"
-wait "$BRIDGE_PID" 2>/dev/null || true
+stop_bridge
 mark="$(bridge_log_lines)"
 start_bridge INTUNE_RESOURCE_URL="https://wrong.example/"
 reset_records
@@ -232,5 +276,27 @@ if enroll "$c" wrongscope && [[ -s wrongscope.crt ]]; then fail "enrollment shou
 grep -q "invalid_resource" <<<"$(bridge_log_since "$mark")" ||
   fail "the bridge didn't log the sign-in failure (invalid_resource)"
 echo "refused"
+
+log "Case 5: workload identity federation → certificate issued with no client secret"
+stop_bridge
+# Stand-in for the kubelet-projected service account token. The mock accepts
+# only this exact assertion, so success proves the file's token was presented.
+sa_token="e2e-projected-sa-token-$(rand)"
+printf '%s' "$sa_token" >sa-token
+restart_mock -client-assertion "$sa_token"
+BRIDGE_CONFIG=bridge-wi.yaml
+mark="$(bridge_log_lines)"
+# The variables the Azure workload identity webhook injects into the pod.
+start_bridge AZURE_TENANT_ID=e2e-tenant AZURE_CLIENT_ID=e2e-client \
+  AZURE_FEDERATED_TOKEN_FILE="$STATE/sa-token" AZURE_AUTHORITY_HOST=https://login.microsoftonline.com/
+grep -q "using workload identity federation" <<<"$(bridge_log_since "$mark")" ||
+  fail "the bridge didn't use workload identity"
+reset_records
+c="ok-$(rand)"
+enroll "$c" wi || { cat wi.scepclient.log; fail "enrollment with workload identity failed"; }
+for _ in $(seq 1 25); do records | jq -e 'map(select(.kind=="success")) | length == 1' >/dev/null && break; sleep 0.2; done
+records | jq -e --arg c "$c" '.[0].kind == "validate" and .[0].challenge == $c and .[1].kind == "success"' >/dev/null ||
+  fail "unexpected mock records with workload identity: $(records)"
+echo "issued and reported using the federated token"
 
 printf '\nE2E PASS\n'

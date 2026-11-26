@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@v7.0.0
@@ -29,6 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@v7.0.0
@@ -42,6 +46,24 @@ jobs:
       # the standard vet checks as part of the same pass.
       - name: Test
         run: go test -race -vet=all ./...
+
+  # Known vulnerabilities in the module graph and the Go toolchain that the code
+  # actually reaches. govulncheck is pinned to an exact version; `go run` checks
+  # it against go.sum's source of truth, the Go checksum database.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
 
   # Full SCEP enrollment: step-ca -> bridge -> Intune mock, no Microsoft tenant.
   # Tools are downloaded from their official releases and checked against
