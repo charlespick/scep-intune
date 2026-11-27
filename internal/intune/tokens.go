@@ -11,20 +11,53 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 )
 
-// EntraTokens acquires tokens via the Entra ID client-credentials flow.
+// EntraTokens acquires app-only tokens from Entra ID with an Azure SDK
+// credential: a client secret or a federated (workload identity) assertion.
 type EntraTokens struct {
-	cred *azidentity.ClientSecretCredential
+	cred azcore.TokenCredential
 }
 
 // Compile-time check: EntraTokens must satisfy the tokenSource interface.
 var _ tokenSource = (*EntraTokens)(nil)
 
-// NewEntraTokens builds a tokenSource from an Entra app registration.
-// authorityHost is the Entra sign-in host; empty or the commercial-cloud host
-// keeps the Azure SDK defaults.
+// NewEntraTokens builds a tokenSource from an Entra app registration's client
+// secret. authorityHost is the Entra sign-in host; empty or the
+// commercial-cloud host keeps the Azure SDK defaults.
 func NewEntraTokens(tenantID, clientID, clientSecret, authorityHost string) (*EntraTokens, error) {
-	cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret,
-		credentialOptions(authorityHost, os.Getenv(azureAuthorityHostEnv)))
+	var opts *azidentity.ClientSecretCredentialOptions
+	if a := credentialOptions(authorityHost, os.Getenv(azureAuthorityHostEnv)); a != nil {
+		opts = &azidentity.ClientSecretCredentialOptions{
+			ClientOptions:            a.ClientOptions,
+			DisableInstanceDiscovery: a.DisableInstanceDiscovery,
+		}
+	}
+	cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &EntraTokens{cred: cred}, nil
+}
+
+// NewWorkloadIdentityTokens builds a tokenSource that exchanges the token in
+// tokenFile (a Kubernetes projected service account token, audience
+// api://AzureADTokenExchange) for Entra tokens, through a federated identity
+// credential on the app registration (or user-assigned managed identity)
+// identified by clientID. No secret is stored: the SDK re-reads the file,
+// which the kubelet rotates, at least every 10 minutes.
+//
+// tenantID, clientID and tokenFile are always passed explicitly, so the SDK's
+// own AZURE_* fallbacks never apply silently; config resolves them first.
+func NewWorkloadIdentityTokens(tenantID, clientID, tokenFile, authorityHost string) (*EntraTokens, error) {
+	opts := &azidentity.WorkloadIdentityCredentialOptions{
+		TenantID:      tenantID,
+		ClientID:      clientID,
+		TokenFilePath: tokenFile,
+	}
+	if a := credentialOptions(authorityHost, os.Getenv(azureAuthorityHostEnv)); a != nil {
+		opts.ClientOptions = a.ClientOptions
+		opts.DisableInstanceDiscovery = a.DisableInstanceDiscovery
+	}
+	cred, err := azidentity.NewWorkloadIdentityCredential(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -69,6 +102,12 @@ func KnownMicrosoftAuthority(host string) bool {
 	return false
 }
 
+// authorityOptions are the credential options that select the Entra authority.
+type authorityOptions struct {
+	azcore.ClientOptions
+	DisableInstanceDiscovery bool
+}
+
 // credentialOptions returns nil (the SDK defaults, exactly as before endpoints
 // were configurable) for an empty or commercial-cloud authority host, unless
 // AZURE_AUTHORITY_HOST would make the SDK use another host: then the options
@@ -78,17 +117,15 @@ func KnownMicrosoftAuthority(host string) bool {
 // For any other host they point the SDK there and disable instance discovery,
 // which would otherwise ask login.microsoftonline.com to approve the unknown
 // host: impossible for a mock and unwanted for a national cloud's own host.
-func credentialOptions(authorityHost, envAuthorityHost string) *azidentity.ClientSecretCredentialOptions {
+func credentialOptions(authorityHost, envAuthorityHost string) *authorityOptions {
 	public := cloud.AzurePublic.ActiveDirectoryAuthorityHost
 	if authorityHost == "" || sameHost(authorityHost, public) {
 		if !EnvAuthorityConflicts(public, envAuthorityHost) {
 			return nil
 		}
-		return &azidentity.ClientSecretCredentialOptions{
-			ClientOptions: azcore.ClientOptions{Cloud: cloud.AzurePublic},
-		}
+		return &authorityOptions{ClientOptions: azcore.ClientOptions{Cloud: cloud.AzurePublic}}
 	}
-	return &azidentity.ClientSecretCredentialOptions{
+	return &authorityOptions{
 		ClientOptions: azcore.ClientOptions{
 			Cloud: cloud.Configuration{ActiveDirectoryAuthorityHost: authorityHost},
 		},

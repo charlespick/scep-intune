@@ -29,6 +29,16 @@ var ErrRejected = errors.New("intune: validation rejected")
 // server goroutines under load.
 const intuneHTTPTimeout = 15 * time.Second
 
+// maxResponseBytes caps a Graph or Intune response body. Real responses are a
+// few hundred bytes; the cap keeps a misbehaving upstream from exhausting
+// memory.
+const maxResponseBytes = 1 << 20
+
+// errRedirect refuses redirects: every request carries a bearer token, which
+// must only ever reach the configured Graph URL or the discovered Intune
+// service, never a host a 3xx points to.
+var errRedirect = errors.New("intune: refusing to follow a redirect with a bearer token")
+
 // tokenSource provides OAuth2 bearer tokens for a given scope. The name mirrors
 // the standard library's oauth2.TokenSource, which is the idiomatic name for this
 // abstraction, so the -er-suffix convention (sonar godre:S8196) does not apply.
@@ -62,7 +72,10 @@ type Client struct {
 // Intune as callerInfo, and talks to the Microsoft endpoints in ep.
 func New(tokens tokenSource, callerInfo string, ep Endpoints) *Client {
 	return &Client{
-		http:       &http.Client{Timeout: intuneHTTPTimeout},
+		http: &http.Client{
+			Timeout:       intuneHTTPTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return errRedirect },
+		},
 		tokens:     tokens,
 		callerInfo: callerInfo,
 		ep:         ep,
@@ -95,11 +108,11 @@ func (c *Client) discover(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("intune: discovery returned HTTP %d", resp.StatusCode)
 	}
 	var disc discoveryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&disc); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&disc); err != nil {
 		return "", err
 	}
 	for _, e := range disc.Value {
@@ -122,13 +135,14 @@ func (c *Client) discover(ctx context.Context) (string, error) {
 }
 
 // checkServiceURI refuses a discovered service address the bridge must not send
-// its Intune token to: it must be an absolute URL, and https whenever the Graph
-// URL is (always in production, where config only accepts https; tests may run
-// Graph over plain http).
+// its Intune token to: it must be an absolute URL without credentials, query or
+// fragment (paths are appended to it), and https whenever the Graph URL is
+// (always in production, where config only accepts https; tests may run Graph
+// over plain http).
 func (c *Client) checkServiceURI(uri string) error {
 	u, err := url.Parse(uri)
-	if err != nil || u.Host == "" {
-		return fmt.Errorf("intune: discovery returned an invalid %s URI %q", validationServiceName, uri)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		return fmt.Errorf("intune: discovery returned an invalid %s URI", validationServiceName)
 	}
 	if strings.HasPrefix(c.ep.GraphURL, "https://") && u.Scheme != "https" {
 		return fmt.Errorf("intune: discovery returned a non-https %s URI %q", validationServiceName, uri)
@@ -164,9 +178,12 @@ func (c *Client) post(ctx context.Context, path string, payload any) ([]byte, in
 		return nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	rb, err := io.ReadAll(resp.Body)
+	rb, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, resp.StatusCode, err
+	}
+	if len(rb) > maxResponseBytes {
+		return nil, resp.StatusCode, fmt.Errorf("intune: %s response exceeds %d bytes", path, maxResponseBytes)
 	}
 	// A non-2xx is a transport/auth/throttling failure, distinct from a
 	// validation rejection (which Intune returns as HTTP 200 with a code).

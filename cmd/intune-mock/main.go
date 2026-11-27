@@ -56,6 +56,7 @@ func run() int {
 	appID := fs.String("app-id", "", "Intune app ID answered by discovery (default Intune's real app ID)")
 	clientID := fs.String("client-id", "", "only client ID the token endpoint accepts (default: any non-empty)")
 	clientSecret := fs.String("client-secret", "", "only client secret the token endpoint accepts (default: any non-empty)")
+	clientAssertion := fs.String("client-assertion", "", "only client assertion (federated token) the token endpoint accepts (default: any non-empty)")
 	maxRecords := fs.Int("max-records", 1000, "size of the /_mock/requests log; oldest entries are dropped")
 
 	// Environment first, flags override.
@@ -75,13 +76,14 @@ func run() int {
 	}
 
 	m := intunemock.New(intunemock.Options{
-		BaseURL:      *baseURL,
-		GraphScope:   *graphScope,
-		IntuneScope:  *intuneScope,
-		AppID:        *appID,
-		ClientID:     *clientID,
-		ClientSecret: *clientSecret,
-		MaxRecords:   *maxRecords,
+		BaseURL:         *baseURL,
+		GraphScope:      *graphScope,
+		IntuneScope:     *intuneScope,
+		AppID:           *appID,
+		ClientID:        *clientID,
+		ClientSecret:    *clientSecret,
+		MaxRecords:      *maxRecords,
+		ClientAssertion: *clientAssertion,
 	})
 	logged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Info("request", "method", r.Method, "path", r.URL.Path)

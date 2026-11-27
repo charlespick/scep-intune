@@ -44,7 +44,14 @@ SCEP_VALIDATE_SECRET=… SCEP_NOTIFY_SECRET=… \
   ./bin/scep-intune -config config.example.yaml
 ```
 
-To run the bridge in a container, build it with `CGO_ENABLED=0`. That gives a
+Both webhook secrets are required: the bridge refuses to start without them.
+On Kubernetes, the Entra client secret can be replaced by **workload identity
+federation**, so the bridge holds no long-lived Entra credential: see
+[docs/kubernetes.md](docs/kubernetes.md).
+
+The [Dockerfile](Dockerfile) builds a distroless image that runs as a non-root
+user and reads `/etc/scep-intune/config.yaml`. To build your own container
+instead, build the bridge with `CGO_ENABLED=0`. That gives a
 statically linked binary, which runs in minimal images without a C library
 (`scratch`, distroless or Chainguard `static`). With cgo enabled, the default
 wherever a C compiler is installed, Go's `net` package links against libc and
@@ -75,10 +82,34 @@ vanilla. Step-by-step guide, including the non-obvious gotchas:
 
 - Requests are rejected unless the HMAC-SHA256 signature matches the per-endpoint
   secret (`SCEP_VALIDATE_SECRET` for `/validate`, `SCEP_NOTIFY_SECRET` for `/notify`).
+  Both are required, at least 32 bytes and distinct; the bridge won't start otherwise.
+- The signed request timestamp must be within `webhook.max_request_age` (5 min),
+  limiting replay of a captured request.
+- Optional mutual TLS (`server.tls.client_ca`) restricts the webhook endpoints to
+  step-ca's own client certificate; TLS 1.3 by default; the serving certificate is
+  reloaded when renewed.
+- Bearer tokens are never sent across redirects, and the Intune address from Graph
+  discovery must be `https` with no credentials, query or fragment.
+- The bridge can only refuse what step-ca asks it: follow the
+  [provisioner checklist](docs/step-ca-setup.md#provisioner-checklist).
+- Security review notes for this fork: [docs/security-review.md](docs/security-review.md).
 - A definitive Intune rejection returns `allow:false`; a transient/upstream error
   returns HTTP 502 so step-ca fails the request and the device retries.
 - The bridge stores **no** private keys or certificates and is safe to scale
   horizontally.
+
+## Releasing
+
+Push a `v<semver>` tag (`v1.2.0`, or `v1.2.0-rc.1` for a prerelease) on a commit
+on `main`. CI runs every check, pushes `ghcr.io/charlespick/scep-intune:<version>`
+(and `:latest` for a non-prerelease), and creates a GitHub release that names the
+image digest. A tag that is not on `main` is built and tested but not released.
+
+```bash
+git tag v1.2.0 origin/main && git push origin v1.2.0
+```
+
+`test/image-smoke.sh <image>` runs the image's smoke test locally.
 
 ## License
 

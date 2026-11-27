@@ -10,7 +10,15 @@ non-obvious failure modes.
 The bridge authenticates to Intune and Microsoft Graph as an Entra application.
 
 1. **App registrations → New registration.**
-2. **Certificates & secrets → New client secret** → use as `INTUNE_CLIENT_SECRET`.
+2. Give the app a credential, one of:
+   - **Kubernetes (recommended, secretless):** **Certificates & secrets →
+     Federated credentials → Add credential → Kubernetes accessing Azure
+     resources**, trusting your cluster's service account issuer for the
+     bridge's service account. No secret exists to leak or rotate. See
+     [kubernetes.md](kubernetes.md).
+   - **Anywhere else:** **Certificates & secrets → New client secret** → use as
+     `INTUNE_CLIENT_SECRET` (better: `INTUNE_CLIENT_SECRET_FILE`). Set a short
+     expiry and rotate it.
 3. **API permissions → Application permissions**, then grant admin consent for:
    - **Microsoft Intune → `scep_challenge_provider`** — to call the SCEP
      validation/notification API.
@@ -24,8 +32,8 @@ The bridge authenticates to Intune and Microsoft Graph as an Entra application.
 
 Create an SCEP provisioner and attach the two webhooks. Because `webhook add`
 generates a secret per webhook and **a `ca.json` provisioner can't store a
-webhook secret** (`json:"-"`), run step-ca in **remote-management (admin) mode**
-so the secrets are real.
+webhook secret** (`json:"-"`), step-ca must run in **remote-management (admin)
+mode**: the bridge refuses to start without both secrets.
 
 ```bash
 # SCEP provisioner. encryption id 2 = AES-256-CBC (Windows rejects the DES
@@ -72,6 +80,40 @@ step certificate create "Intune SCEP RA" ra.pem ra.key \
 
 (The CA keys themselves must be **RSA** — Windows/Intune can't verify ECDSA CA
 signatures.)
+
+### Provisioner checklist
+
+The bridge can only refuse what step-ca asks it about. In step-ca's SCEP
+provisioner, challenge validation is chosen like this (`selectValidationMethod`
+in step-ca v0.30.2):
+
+1. if at least one `SCEPCHALLENGE` webhook applies, the webhooks decide, and
+   **any one** answering `allow: true` is enough;
+2. otherwise, if a static `challenge` is set, it is compared;
+3. otherwise **no challenge is checked at all**: anyone who can reach
+   `/scep/intune` gets a certificate.
+
+So, for the `intune` provisioner:
+
+- **Exactly one `SCEPCHALLENGE` webhook, this bridge's**, with
+  `--cert-type X509` (or `ALL`). Another challenge webhook would be an
+  independent way to be allowed. If the webhook is ever deleted, or its cert
+  type no longer applies, step-ca silently falls back to rule 2 or 3. Alert on
+  changes to the provisioner (admin API audit logs) and test enrollment with a
+  bad challenge after every change.
+- **No static `challenge`** on the provisioner.
+- Keep **TLS client authentication on** for both webhooks (don't pass
+  `--disable-tls-client-auth`), and set `server.tls.client_ca` on the bridge,
+  so the bridge only answers step-ca.
+- Bound what can be issued even with a valid challenge: Intune checks the
+  challenge against the CSR, but step-ca signs what its **template** produces.
+  Keep the default SCEP template (or one that only copies the subject/SANs
+  your SCEP profile requests), set the provisioner's `maxTLSCertDuration` to
+  the profile's validity, and use step-ca's X.509 **policy** (allowed DNS
+  names / URIs / emails) to restrict SANs to your device naming scheme.
+- Use a **dedicated intermediate** (or at least a dedicated provisioner) for
+  Intune devices, so a compromise of this path can be revoked without touching
+  other issuance.
 
 ## 3. Intune profiles
 

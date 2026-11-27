@@ -48,6 +48,24 @@ updates:
     commit-message:
       prefix: "ci"
 
+  # The Dockerfile's base images, pinned by tag and digest. The golang image runs with
+  # GOTOOLCHAIN=local, so it must stay at or above the go directive in go.mod.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        applies-to: version-updates
+        patterns: ["*"]
+      docker-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(docker)"
+
 # Not tracked by Dependabot, so bumped by hand:
 # - The Go toolchain: the `go` directive in go.mod, which CI follows through go-version-file.
 # - golangci-lint: the `version` input of golangci-lint-action in ci.yml.

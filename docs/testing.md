@@ -64,6 +64,7 @@ go build -o bin/intune-mock ./cmd/intune-mock
 | `-app-id` | `MOCK_APP_ID` | Intune's app ID |
 | `-client-id` | `MOCK_CLIENT_ID` | any non-empty client ID accepted |
 | `-client-secret` | `MOCK_CLIENT_SECRET` | any non-empty secret accepted |
+| `-client-assertion` | `MOCK_CLIENT_ASSERTION` | any non-empty JWT client assertion (workload identity) accepted |
 | `-max-records` | `MOCK_MAX_RECORDS` | `1000` (oldest entries in `/_mock/requests` are dropped) |
 
 Point the bridge at it, leaving `resource_url` and `app_id` at their defaults,
@@ -77,7 +78,12 @@ SSL_CERT_FILE=/path/to/ca-that-signed-mock.crt \
 ```
 
 `tenant_id`, `client_id` and `client_secret` are still required, but any values
-work.
+work. The token endpoint also accepts a JWT client assertion
+(`client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`),
+as `intune.auth: workload_identity` sends it; it doesn't verify the assertion's
+signature, but with `-client-assertion` only that exact value is accepted. The
+webhook secrets must still be real-looking (two distinct base64 values of at
+least 32 bytes).
 
 ## End-to-end test
 
