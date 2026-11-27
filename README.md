@@ -49,7 +49,9 @@ On Kubernetes, the Entra client secret can be replaced by **workload identity
 federation**, so the bridge holds no long-lived Entra credential: see
 [docs/kubernetes.md](docs/kubernetes.md).
 
-To run the bridge in a container, build it with `CGO_ENABLED=0`. That gives a
+The [Dockerfile](Dockerfile) builds a distroless image that runs as a non-root
+user and reads `/etc/scep-intune/config.yaml`. To build your own container
+instead, build the bridge with `CGO_ENABLED=0`. That gives a
 statically linked binary, which runs in minimal images without a C library
 (`scratch`, distroless or Chainguard `static`). With cgo enabled, the default
 wherever a C compiler is installed, Go's `net` package links against libc and
@@ -95,6 +97,19 @@ vanilla. Step-by-step guide, including the non-obvious gotchas:
   returns HTTP 502 so step-ca fails the request and the device retries.
 - The bridge stores **no** private keys or certificates and is safe to scale
   horizontally.
+
+## Releasing
+
+Push a `v<semver>` tag (`v1.2.0`, or `v1.2.0-rc.1` for a prerelease) on a commit
+on `main`. CI runs every check, pushes `ghcr.io/charlespick/scep-intune:<version>`
+(and `:latest` for a non-prerelease), and creates a GitHub release that names the
+image digest. A tag that is not on `main` is built and tested but not released.
+
+```bash
+git tag v1.2.0 origin/main && git push origin v1.2.0
+```
+
+`test/image-smoke.sh <image>` runs the image's smoke test locally.
 
 ## License
 

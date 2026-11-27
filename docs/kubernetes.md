@@ -113,9 +113,9 @@ spec:
 
 ## 3. A hardened Deployment
 
-This repository ships no container image (build one from `make build`, a
-static binary, on a minimal base such as distroless `static` or Chainguard
-`static`, and reference it **by digest**). A deployment that suits software
+Released images are at `ghcr.io/charlespick/scep-intune` (see
+[Releasing](../README.md#releasing)); each GitHub release names its image
+digest. Reference the image **by digest**. A deployment that suits software
 in a CA's issuing path:
 
 ```yaml
@@ -143,7 +143,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: scep-intune
-          image: <registry>/scep-intune@sha256:<digest>
+          image: ghcr.io/charlespick/scep-intune:<version>@sha256:<digest>
           args: ["-config", "/etc/scep-intune/config.yaml"]
           env:
             - {name: INTUNE_AUTH, value: workload_identity}
